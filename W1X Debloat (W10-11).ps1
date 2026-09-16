@@ -1,7 +1,30 @@
-$SV = "3.27"
+$SV = "3.28"
 <#############################################################################################################################>
 <#
 [>] Change Log
+2026-09-16 - v3.28
+    - Fixed Applications: Metro apps now remove for all users ('-AllUsers' was missing, removal only applied to the account running the script).
+    - Fixed Applications: Package enumeration moved outside the removal loop (was re-running for every entry in the list).
+    - Fixed Windows 11 detection: Now uses build number instead of the OS name, which is localized and failed on non-English installs.
+    - Fixed Windows Update Delivery Optimization: Moved to the HKLM policy (DODownloadMode), the previous user hive path was unreliable.
+    - Added Windows: LSA Protection (RunAsPPL) - blocks credential dumping from LSASS.
+        - Previous versions disabled this alongside VBS. It is not part of VBS and has no performance cost.
+        - Set to '2' (no UEFI lock) so it remains revertible.
+    - Added Windows: Microsoft vulnerable driver blocklist enforced (mitigates the kernel-mode bypass for the above).
+    - Added Windows: Application Experience policies disabled (AITEnable/DisableInventory/DisablePCA).
+        - Scheduled tasks alone were being recreated by feature updates.
+    - Added Windows: Telemetry ETW autologgers disabled (Diagtrack-Listener/SQMLogger).
+        - These kernel trace sessions keep writing to disk even with the DiagTrack service stopped.
+    - Added Explorer: NTFS 8.3 short filename creation disabled.
+    - Added Cleanup: TRIM (Optimize-Volume -ReTrim) after the space cleanup, on SSDs only.
+    - Updated Services: Prefetcher/Superfetch registry values disabled on SSDs, to match the SysMain service.
+    - Updated Services: Telephony (TapiSrv) set to Manual instead of Disabled.
+        - RasMan depends on it, disabling it can break the built-in Windows VPN client.
+    - Removed Explorer: 'Convert to JPG' right click menu - was non-functional, and is now cleaned up if previously added.
+    - Removed Network: Legacy and no-op TCP tweaks (CTCP, auto-tuning, DCA, ECN, NetDMA, IRPStackSize).
+        - DCA/NetDMA target a subsystem removed in Windows 8; auto-tuning and ECN already matched the defaults.
+        - CTCP is a downgrade from the modern CUBIC default.
+        - CTCP and IRPStackSize are reverted on machines that ran previous versions.
 2026-09-14 - v3.27
     - Fixed Set-Registry: Now corrects existing values with the wrong registry type.
     - Updated Explorer: Disabled window grouping in Taskbar and Alt+Tab (EnableTaskGroups).
@@ -406,20 +429,24 @@ $Apps = @(
 
 )
 
+# Enumerate once - both calls take seconds, and were previously being re-run for every pattern below
+$AllPackages    = Get-AppxPackage -AllUsers
+$AllProvisioned = Get-AppxProvisionedPackage -Online
+
 foreach ($App in $Apps) {
     # Check if installed for any user
-    $Installed = Get-AppxPackage -AllUsers | Where-Object { $_.Name -like $App }
-    
+    $Installed = $AllPackages | Where-Object { $_.Name -like $App }
+
     if ($Installed) {
         Write-Host " - Removing: $App" -ForegroundColor Green
-        
-        # Remove for all existing users
+
+        # Remove for all existing users (-AllUsers is required, without it this only removes for the account running the script)
         foreach ($Install in $Installed) {
-            Remove-AppxPackage -Package $Install.PackageFullName -ErrorAction SilentlyContinue
+            Remove-AppxPackage -Package $Install.PackageFullName -AllUsers -ErrorAction SilentlyContinue
         }
 
         # Remove provisioned package (prevents future installs)
-        $Provisioned = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $App }
+        $Provisioned = $AllProvisioned | Where-Object { $_.DisplayName -like $App }
         foreach ($Prov in $Provisioned) {
             Remove-AppxProvisionedPackage -Online -PackageName $Prov.PackageName -ErrorAction SilentlyContinue
         }
@@ -791,7 +818,6 @@ $services = @(
     "PcaSvc",							# Program Compatibility Assistant Service
     "RemoteRegistry",					# Remote Registry
     "RetailDemo",						# Retail Demo
-    "TapiSrv",                          # Telephony
     "Themes",							# Themes
     "wuqisvc",                          # Usage and Quality Insights
     "WSAIFabricSvc",                    # Windows AIFabric Support
@@ -821,6 +847,11 @@ if ($disk -and $disk.MediaType -eq 'SSD') {
     Stop-Service -Name SysMain -Force
     Set-Service -Name SysMain -StartupType Disabled
     Write-Host " - Service: Superfetch/Prefetch [DISABLED]" -ForegroundColor Green
+
+    # Prefetcher itself still writes trace data even with SysMain stopped
+    Set-Registry -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -Name 'EnablePrefetcher' -Value 0 -Type DWord
+    Set-Registry -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' -Name 'EnableSuperfetch' -Value 0 -Type DWord
+    Write-Host " - Service: Prefetcher/Superfetch Registry [DISABLED]" -ForegroundColor Green
 } else {
     Write-Host " - Service: Superfetch/Prefetch [UNMODIFIED (HDD Detected)]" -ForegroundColor Green
 }
@@ -842,10 +873,11 @@ if (Get-Service -Name 'WMPNetworkSvc' -ErrorAction SilentlyContinue) {
     sc.exe delete WMPNetworkSvc
     Write-Host " - Service: Windows Media Player Network Share [DELETED]" -Foregroundcolor Green
 }
-#> Manual - Bluetooth
+#> Manual - Bluetooth / Telephony
 $services = @(
     "BTAGService",  # Bluetooth
-    "bthserv"       # Bluetooth
+    "bthserv",      # Bluetooth
+    "TapiSrv"       # Telephony (RasMan depends on it - disabling breaks the built-in VPN client)
 )
 foreach ($service in $services) {
     $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
@@ -979,21 +1011,9 @@ if((Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\*\shell\pintohomefile") -ne $
 New-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Classes\*\shell\pintohomefile' -Name 'ProgrammaticAccessOnly' -Value "" -PropertyType String -Force | Out-Null
 Write-Host "Explorer: 'Add to Favorites' - Right Click Context Menu [REMOVED]" -ForegroundColor Green
 
-# Right Click Context Menu - Add "Convert to JPG"
-$key = "HKLM:\SOFTWARE\Classes\SystemFileAssociations\.jfif\shell\ConvertToJPG"
-if (!(Test-Path $key)) {
-    $value = "Convert to JPG"
-    $command = "powershell.exe Rename-Item -Path '%1' -NewName ('%1.jpg')"
-    New-Item -Path $key -Force | Out-Null
-    Set-ItemProperty -Path $key -Name "(Default)" -Value $value
-    New-ItemProperty -LiteralPath $key -Name 'Icon' -Value 'shell32.dll,-16805' -PropertyType String -Force | Out-Null
-    $commandKey = Join-Path $key "command"
-    New-Item -Path $commandKey -Force | Out-Null
-    Set-ItemProperty -Path $commandKey -Name "(Default)" -Value $command
-    Write-Host "Explorer: File Convert .JFIF to .JPG - Right Click Context Menu [ADDED]" -ForegroundColor Green
-} ELSE {
-    Write-Host "Explorer: File Convert .JFIF to .JPG - Right Click Context Menu [ADDED (Previously)]" -ForegroundColor Green
-}
+# Right Click Context Menu - Remove "Convert to JPG" (non-functional, added by script versions <= v3.27)
+Set-Registry -Remove Path -Path "HKLM:\SOFTWARE\Classes\SystemFileAssociations\.jfif\shell\ConvertToJPG"
+Write-Host "Explorer: File Convert .JFIF to .JPG - Right Click Context Menu [REMOVED]" -ForegroundColor Green
 
 # Right Click Context Menu "Add Watermark"
 $scriptDir = "C:\ProgramData\AV\Watermark"
@@ -1241,13 +1261,17 @@ Write-Host "Explorer: Folder Grouping [DISABLED]" -ForegroundColor Green
 Set-Registry -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'NtfsDisableLastAccessUpdate' -Value 1 -Type DWord
 Write-Host "Explorer: NTFS Last Access Timestamp [DISABLED]" -ForegroundColor Green
 
+# Stop creation of legacy 8.3 short filenames (applies to newly created files only)
+Set-Registry -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name 'NtfsDisable8dot3NameCreation' -Value 1 -Type DWord
+Write-Host "Explorer: NTFS 8.3 Short Filename Creation [DISABLED]" -ForegroundColor Green
+
 Set-Registry -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "EnableTaskGroups" -Value 0 -Type DWord
 Write-Host "Explorer: Alt+Tab - Windows Only [UPDATED]" -ForegroundColor Green
 <###################################### EXPLORER TWEAKS [END] ######################################>
 
 
 <###################################### START MENU TWEAKS [START] ######################################>
-if ((Get-CimInstance -ClassName Win32_OperatingSystem).Caption -like "Microsoft Windows 11*") {
+if ([int](Get-CimInstance -ClassName Win32_OperatingSystem).BuildNumber -ge 22000) {
     #Source: https://vhorizon.co.uk/windows-11-start-menu-layout-group-policy/
     Set-Registry -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "TaskbarAl" -Value 0 -Type DWord
 	Write-Host "Start Menu: Alignment - Left" -ForegroundColor Green
@@ -1325,31 +1349,16 @@ Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | ForEach-Object {
 }
 Write-Host "Network: Ethernet/Wireless Power Saving Settings [DISABLED]" -ForegroundColor Green
 
-# Source: https://www.majorgeeks.com/content/page/irpstacksize.html (Default 15-20 connections, increased to 50)
-Set-Registry -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'IRPStackSize' -Value 48 -Type DWord
-Write-Host "Network: Increased Performance for 'I/O Request Packet Stack Size" -ForegroundColor Green
-
 Set-Registry -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile' -Name 'NetworkThrottlingIndex' -Value -1 -Type DWord
 Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Psched' -Name 'NonBestEffortLimit' -Value 0 -Type DWord
 Write-Host "Network: Throttling Index [DISABLED]" -ForegroundColor Green
 
-netsh int tcp set global autotuninglevel=normal
-Write-Host "Network: TCP Auto-Tuning [UPDATED]" -ForegroundColor Green
-
 netsh int tcp set global rss=enabled
 Write-Host "Network: Receive-Side Scaling (RSS) [ENABLED]" -ForegroundColor Green
 
-netsh int tcp set global dca=enabled
-Write-Host "Network: Direct Cache Access (DCA) [ENABLED]" -ForegroundColor Green
-
-netsh int tcp set global ecncapability=disabled
-Write-Host "Network: Explicit Congestion Notification (ECN) [DISABLED]" -ForegroundColor Green
-
-netsh int tcp set global netdma=disabled
-Write-Host "Network: NetDMA [DISABLED]" -ForegroundColor Green
-
-netsh int tcp set supplemental template=internet congestionprovider=ctcp
-Write-Host "Network: TCP Congestion Provider set to Compound TCP (CTCP)" -ForegroundColor Green
+# Revert legacy network tweaks applied by script versions <= v3.27
+netsh int tcp set supplemental template=internet congestionprovider=default
+Set-Registry -Remove Value -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'IRPStackSize'
 
 # Windows 11 24H2+ made SMB signing mandatory for all outbound connections by default (previously only required for domain controllers).
 # This breaks anonymous/guest SMB shares (e.g. Samba "guest ok" shares), since guest sessions can't satisfy mandatory signing.
@@ -1457,6 +1466,12 @@ Write-Host "Windows: Filter Keys [DISABLED]" -ForegroundColor Green
 Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat' -Name 'DisableUAR' -Value 1 -Type DWord
 Write-Host "Windows: Troubleshooting 'Steps Recorder' [DISABLED]" -ForegroundColor Green
 
+# Policy-level equivalent of the Application Experience scheduled tasks - stops feature updates re-enabling them
+Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat' -Name 'AITEnable' -Value 0 -Type DWord
+Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat' -Name 'DisableInventory' -Value 1 -Type DWord
+Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat' -Name 'DisablePCA' -Value 1 -Type DWord
+Write-Host "Windows: Application Experience - Telemetry/Inventory Policies [DISABLED]" -ForegroundColor Green
+
 Set-Registry -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR" -Name "AppCaptureEnabled" -Value 0 -Type DWord
 Set-Registry -Path "HKCU:\System\GameConfigStore" -Name "GameDVR_Enabled" -Value 0 -Type DWord
 Set-Registry -Path 'HKCU:\Software\Microsoft\GameBar' -Name 'AllowAutoGameMode' -Value 1 -Type DWord
@@ -1525,7 +1540,7 @@ if ($RamInKB -ge 16000000) {
 
 # Windows Update Delivery Optimization
 # Source: https://www.elevenforum.com/t/turn-on-or-off-windows-update-delivery-optimization-in-windows-11.3136
-Set-Registry -Path 'Registry::\HKEY_USERS\S-1-5-20\Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings' -Name 'DownloadMode' -Value 0 -Type DWord
+Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -Name 'DODownloadMode' -Value 0 -Type DWord
 Write-Host "Windows: Update Delivery Optimization - Direct Download [UPDATED]" -ForegroundColor Green
 
 # Windows > Display 'Ease cursor Movement between displays'
@@ -1542,9 +1557,21 @@ Write-Host "Windows: Background (Spotlight) - 'Learn About This Background' [REM
 Set-Registry -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableVirtualizationBasedSecurity" -Value 0 -Type DWord
 Set-Registry -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "RequirePlatformSecurityFeatures" -Value 0 -Type DWord
 #> Disable Credential Guard
-Set-Registry -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -Value 0 -Type DWord
 Set-Registry -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LsaCfgFlags" -Value 0 -Type DWord
 Write-Host "Windows: Virtualization-Based Security [DISABLED]" -ForegroundColor Green
+
+# LSA Protection - NOT part of VBS, and has no performance cost. Runs LSASS as a protected process,
+# which is what blocks credential dumping (mimikatz etc). Value 2 = enabled without UEFI lock, so it
+# stays revertible via the registry. Script versions <= v3.27 set this to 0, this corrects them.
+Set-Registry -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -Value 2 -Type DWord
+Set-Registry -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPLBoot" -Value 2 -Type DWord
+Write-Host "Windows: LSA Protection (Credential Dumping Defense) [ENABLED]" -ForegroundColor Green
+
+# Microsoft vulnerable driver blocklist - blocks the signed-but-flawed drivers used to bypass LSA
+# Protection from kernel mode (BYOVD). On by default, but HVCI is disabled above so this is the
+# remaining mitigation for that path. No performance cost.
+Set-Registry -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' -Name 'VulnerableDriverBlocklistEnable' -Value 1 -Type DWord
+Write-Host "Windows: Vulnerable Driver Blocklist [ENABLED]" -ForegroundColor Green
 
 Set-Registry -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" -Name "PowerThrottlingOff" -Value 1 -Type DWord
 Write-Host "Windows: Power Throttling [DISABLED]" -ForegroundColor Green
@@ -1679,6 +1706,20 @@ Write-Host "Windows: Activity Feed [DISABLED]" -ForegroundColor Green
 Set-Registry -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' -Name 'AllowTelemetry' -Value 0 -Type DWord
 Set-Registry -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' -Name 'MaxTelemetryAllowed' -Value 0 -Type DWord
 Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'AllowTelemetry' -Value 0 -Type DWord
+# ETW Autologgers - kernel trace sessions keep writing telemetry to disk even with the DiagTrack service stopped
+# Test-Path guard: session name differs by build, only touch the ones that actually exist
+$autoLoggers = @(
+    "Diagtrack-Listener",               # Windows 11
+    "AutoLogger-Diagtrack-Listener",    # Windows 10
+    "SQMLogger"
+)
+foreach ($autoLogger in $autoLoggers) {
+    $autoLoggerPath = "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\$autoLogger"
+    if (Test-Path $autoLoggerPath) {
+        Set-Registry -Path $autoLoggerPath -Name 'Start' -Value 0 -Type DWord
+    }
+}
+Write-Host "Windows: Telemetry ETW Autologgers [DISABLED]" -ForegroundColor Green
 # Usage / Quality Insights
 Unregister-ScheduledTask -TaskPath "\Microsoft\Windows\UsageAndQualityInsights\" -TaskName "UsageAndQualityInsights-MaintenanceTask" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 Write-Host "Windows: Telementry [DISABLED]" -ForegroundColor Green
@@ -1813,6 +1854,15 @@ Write-Host "8.2 System Files" -ForegroundColor Green
 
             # Windows Update - Start
             Start-Service -Name wuauserv
+
+## TRIM - Notify the SSD of the blocks freed by the cleanup above
+if ($disk -and $disk.MediaType -eq 'SSD') {
+    Write-Host " - Running: TRIM (SSD Detected)" -ForegroundColor Green
+    Optimize-Volume -DriveLetter C -ReTrim -ErrorAction SilentlyContinue
+    Write-Host " - Completed: TRIM" -ForegroundColor Green
+} else {
+    Write-Host " - Skipped: TRIM [UNMODIFIED (HDD Detected)]" -ForegroundColor Green
+}
 
 ## Free Space - Retrieve Updated Free Space
 $FreeSpaceAfter = (Get-PSDrive -Name C).Free / 1GB
