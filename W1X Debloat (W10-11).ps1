@@ -772,6 +772,8 @@ Write-Host "Mozilla Firefox - Privacy [UPDATED]" -ForegroundColor Green
 
 ## 3.2 [11/11] Google Chrome
 Write-Host " - [11/11] Google Chrome" -ForegroundColor Green
+# Disable background apps when Google Chrome is closed.
+Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Google\Chrome' -Name 'BackgroundModeEnabled' -Value 0 -Type DWord
 # Disable usage and crash metrics reporting.
 Set-Registry -Path 'HKLM:\SOFTWARE\Policies\Google\Chrome' -Name 'MetricsReportingEnabled' -Value 0 -Type DWord
 # Disable collection of URL-keyed anonymized browsing data.
